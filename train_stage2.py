@@ -1,345 +1,279 @@
+"""
+Stage 2: Channel-attention fusion + classifier training.
+
+Key fixes vs. original:
+  1. Loads encoder1 + encoder2 from Stage 1 and FREEZES them
+     (set FREEZE_ENCODERS=False below if you want to fine-tune).
+  2. Focal loss with gamma=2.0 + class weights. Focal loss naturally
+     down-weights well-classified majority samples; you do not need to
+     guess perfect class weights to escape the collapse.
+  3. WeightedRandomSampler so each epoch sees a balanced label distribution.
+  4. Early stop on macro-F1.
+  5. Cosine LR schedule with warmup.
+"""
+
+import os
+import math
+import json
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
 import torch.nn.functional as F
-from tqdm import tqdm
-import os
-from models import TransformerEncoder, ChannelAttentionFusion, IntentClassifier
-from data_loader import load_data, create_dataloaders
-from config import Config
 import numpy as np
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from sklearn.metrics import f1_score, accuracy_score, classification_report
+from tqdm import tqdm
 
+from models import (
+    TransformerEncoder, ChannelAttentionFusion, IntentClassifier,
+)
+from data_loader import load_data, ChatbotDataset
+from config import Config
+
+
+FREEZE_ENCODERS = True   # safest default; flip to False for end-to-end fine-tune
+
+
+# ---------------------------------------------------------------------------
+# Focal Loss
+# ---------------------------------------------------------------------------
 class FocalLoss(nn.Module):
-    """Focal Loss for handling class imbalance"""
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+    """
+    Multi-class focal loss with optional class weighting.
+    L = -alpha_c * (1 - p_c)^gamma * log(p_c)
+    """
+    def __init__(self, gamma=2.0, weight=None, label_smoothing=0.0):
         super().__init__()
-        self.alpha = alpha  # Class weights
         self.gamma = gamma
-        self.reduction = reduction
-    
-    def forward(self, inputs, targets):
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
-        
-def create_balanced_dataloader(df, tokenizer, max_length, class_to_idx, batch_size, num_workers):
-    """Create a dataloader with balanced class sampling"""
-    from torch.utils.data import WeightedRandomSampler
-    
-    # Calculate class weights for sampling
-    class_counts = df['intent'].value_counts()
-    total_samples = len(df)
-    
-    # Weight inversely proportional to class frequency
-    class_weights = {intent: total_samples / count for intent, count in class_counts.items()}
-    
-    # Assign weight to each sample
-    sample_weights = df['intent'].map(class_weights).values
-    
-    # Create sampler
-    sampler = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(df),
-        replacement=True
-    )
-    
-    # Create dataset
-    from data_loader import ChatbotDataset
-    dataset = ChatbotDataset(df, tokenizer, max_length, class_to_idx)
-    
-    # Create dataloader with sampler
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=num_workers
-    )
-    
-    return dataloader
+        self.weight = weight
+        self.label_smoothing = label_smoothing
 
-def train_fusion(encoder1, encoder2, fusion, classifier, train_df, val_df, 
-                tokenizer, class_to_idx, config):
-    """Train fusion module with frozen encoders"""
-    
-    # Move to device
-    encoder1 = encoder1.to(config.device)
-    encoder2 = encoder2.to(config.device)
-    fusion = fusion.to(config.device)
-    classifier = classifier.to(config.device)
-    
-    # Freeze encoders
-    for param in encoder1.parameters():
-        param.requires_grad = False
-    for param in encoder2.parameters():
-        param.requires_grad = False
-    
-    encoder1.eval()
-    encoder2.eval()
-    
-    # Calculate class weights for Focal Loss
-    class_counts = train_df['intent'].value_counts()
-    total_samples = len(train_df)
-    class_weights = torch.tensor([
-        total_samples / class_counts[config.classes[i]] 
-        for i in range(config.num_classes)
-    ], dtype=torch.float32).to(config.device)
-    
-    # Normalize weights
-    class_weights = class_weights / class_weights.sum() * config.num_classes
-    
-    print(f"\nClass Weights for Focal Loss:")
-    for i, cls in enumerate(config.classes):
-        print(f"  {cls}: {class_weights[i]:.4f}")
-    
-    # Create balanced dataloaders
-    train_loader = create_balanced_dataloader(
-        train_df, tokenizer, config.max_seq_length, class_to_idx,
-        config.stage2_batch_size, config.num_workers
+    def forward(self, logits, target):
+        ce = F.cross_entropy(
+            logits, target,
+            weight=self.weight,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        # p_t = exp(-ce) is valid when label_smoothing=0; with smoothing it
+        # is a good enough proxy and keeps the focal modulator well-defined.
+        pt = torch.exp(-ce)
+        focal = ((1.0 - pt) ** self.gamma) * ce
+        return focal.mean()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def make_balanced_sampler(labels, num_classes):
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    per_class = 1.0 / np.sqrt(counts)
+    sample_w = per_class[labels]
+    return WeightedRandomSampler(
+        weights=torch.tensor(sample_w, dtype=torch.double),
+        num_samples=len(labels),
+        replacement=True,
     )
-    
-    # Regular validation loader (no balancing needed)
-    from data_loader import ChatbotDataset
-    val_dataset = ChatbotDataset(val_df, tokenizer, config.max_seq_length, class_to_idx)
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=config.stage2_batch_size,
-        shuffle=False,
-        num_workers=config.num_workers
-    )
-    
-    # Optimizer (only fusion + classifier parameters)
-    optimizer = AdamW(
-        list(fusion.parameters()) + list(classifier.parameters()),
-        lr=config.stage2_lr,
-        weight_decay=config.weight_decay,
-        eps=config.adam_epsilon
-    )
-    
-    # Loss function: Focal Loss with reduced entropy regularization
-    focal_loss_fn = FocalLoss(alpha=class_weights, gamma=2.0)
-    entropy_weight = 0.01  # REDUCED from 0.1 to allow soft blending
-    
-    best_val_f1 = 0.0
-    patience = 3
-    patience_counter = 0
-    
-    print(f"\n{'='*50}")
-    print(f"Training Fusion Module with Balanced Sampling")
-    print(f"{'='*50}")
-    print(f"Trainable parameters: {sum(p.numel() for p in fusion.parameters() if p.requires_grad):,}")
-    print(f"Entropy regularization: {entropy_weight}")
-    
-    for epoch in range(config.stage2_epochs):
-        # Training
-        fusion.train()
-        classifier.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-        
-        # Track per-class accuracy
-        class_correct = {cls: 0 for cls in config.classes}
-        class_total = {cls: 0 for cls in config.classes}
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.stage2_epochs}")
-        for batch in pbar:
-            input_ids = batch['input_ids'].to(config.device)
-            attention_mask = batch['attention_mask'].to(config.device)
-            labels = batch['intent'].to(config.device)
-            
-            # Forward pass through frozen encoders
-            with torch.no_grad():
-                h1 = encoder1(input_ids, attention_mask)
-                h2 = encoder2(input_ids, attention_mask)
-            
-            # Fusion with attention
-            h_fused, attention_weights = fusion(h1, h2)
-            
-            # Classification
+
+
+def compute_class_weights(labels, num_classes):
+    counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    w = 1.0 / np.sqrt(counts)
+    w = w * (num_classes / w.sum())
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def load_encoder(config, ckpt_path):
+    encoder = TransformerEncoder(config)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    encoder.load_state_dict(ckpt["encoder"])
+    return encoder
+
+
+# ---------------------------------------------------------------------------
+# Eval
+# ---------------------------------------------------------------------------
+def evaluate(encoder1, encoder2, fusion, classifier, loader, device, num_classes):
+    encoder1.eval(); encoder2.eval(); fusion.eval(); classifier.eval()
+    preds, gts = [], []
+    with torch.no_grad():
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            attn = batch["attention_mask"].to(device)
+            labels = batch["intent"].to(device)
+            h1 = encoder1(input_ids, attn)
+            h2 = encoder2(input_ids, attn)
+            h_fused, _ = fusion(h1, h2)
             logits = classifier(h_fused)
-            
-            # Focal Loss for classification
-            focal_loss = focal_loss_fn(logits, labels)
-            
-            # Entropy regularization (REDUCED to allow soft attention)
-            entropy = -(attention_weights * torch.log(attention_weights + 1e-8)).sum(dim=-1).mean()
-            
-            # Total loss
-            loss = focal_loss + entropy_weight * entropy
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(fusion.parameters()) + list(classifier.parameters()),
-                config.max_grad_norm
-            )
-            optimizer.step()
-            
-            # Metrics
-            train_loss += loss.item()
-            _, predicted = torch.max(logits, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-            
-            # Per-class tracking
-            for i in range(len(labels)):
-                label_name = config.classes[labels[i].item()]
-                class_total[label_name] += 1
-                if predicted[i] == labels[i]:
-                    class_correct[label_name] += 1
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        train_loss /= len(train_loader)
-        train_acc = 100 * train_correct / train_total
-        
-        # Validation
-        encoder1.eval()
-        encoder2.eval()
-        fusion.eval()
-        classifier.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
-        attention_confidence = []
-        
-        # Per-class validation metrics
-        val_class_correct = {cls: 0 for cls in config.classes}
-        val_class_total = {cls: 0 for cls in config.classes}
-        
-        all_preds = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                input_ids = batch['input_ids'].to(config.device)
-                attention_mask = batch['attention_mask'].to(config.device)
-                labels = batch['intent'].to(config.device)
-                
-                h1 = encoder1(input_ids, attention_mask)
-                h2 = encoder2(input_ids, attention_mask)
-                h_fused, attention_weights = fusion(h1, h2)
-                logits = classifier(h_fused)
-                
-                focal_loss = focal_loss_fn(logits, labels)
-                entropy = -(attention_weights * torch.log(attention_weights + 1e-8)).sum(dim=-1).mean()
-                loss = focal_loss + entropy_weight * entropy
-                
-                val_loss += loss.item()
-                _, predicted = torch.max(logits, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-                
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                
-                # Per-class tracking
-                for i in range(len(labels)):
-                    label_name = config.classes[labels[i].item()]
-                    val_class_total[label_name] += 1
-                    if predicted[i] == labels[i]:
-                        val_class_correct[label_name] += 1
-                
-                # Track attention confidence
-                confidence = torch.abs(attention_weights[:, 0] - attention_weights[:, 1])
-                attention_confidence.extend(confidence.cpu().numpy())
-        
-        val_loss /= len(val_loader)
-        val_acc = 100 * val_correct / val_total
-        avg_confidence = np.mean(attention_confidence)
-        uncertain_pct = 100 * sum(1 for c in attention_confidence if c < 0.2) / len(attention_confidence)
-        
-        # Calculate macro F1
-        from sklearn.metrics import f1_score
-        val_macro_f1 = f1_score(all_labels, all_preds, average='macro')
-        
-        print(f"\nEpoch {epoch+1}:")
-        print(f"  Train Loss={train_loss:.4f}, Train Acc={train_acc:.2f}%")
-        print(f"  Val Loss={val_loss:.4f}, Val Acc={val_acc:.2f}%, Macro F1={val_macro_f1:.4f}")
-        print(f"  Attention Confidence: {avg_confidence:.3f}, Uncertain (<0.2): {uncertain_pct:.1f}%")
-        
-        # Show per-class accuracy for rare classes
-        print(f"\n  Rare Class Performance:")
-        for cls in config.rare_classes:
-            if val_class_total[cls] > 0:
-                acc = 100 * val_class_correct[cls] / val_class_total[cls]
-                print(f"    {cls}: {val_class_correct[cls]}/{val_class_total[cls]} ({acc:.1f}%)")
-        
-        # Save best model based on macro F1
-        if val_macro_f1 > best_val_f1:
-            best_val_f1 = val_macro_f1
-            patience_counter = 0
-            os.makedirs(f"{config.checkpoint_dir}/stage2_fusion", exist_ok=True)
-            torch.save({
-                'fusion': fusion.state_dict(),
-                'classifier': classifier.state_dict(),
-                'epoch': epoch,
-                'val_f1': val_macro_f1
-            }, f"{config.checkpoint_dir}/stage2_fusion/fusion_classifier.pt")
-            print(f"  ✓ Saved best model (Macro F1: {val_macro_f1:.4f})")
-        else:
-            patience_counter += 1
-            print(f"  No improvement ({patience_counter}/{patience})")
-            
-            if patience_counter >= patience:
-                print(f"\n  Early stopping triggered!")
-                break
-    
-    return fusion, classifier
+            preds.extend(torch.argmax(logits, dim=-1).cpu().numpy().tolist())
+            gts.extend(labels.cpu().numpy().tolist())
+    acc = accuracy_score(gts, preds)
+    macro_f1 = f1_score(gts, preds, average="macro",
+                        labels=list(range(num_classes)), zero_division=0)
+    return acc, macro_f1, preds, gts
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
     config = Config()
     torch.manual_seed(config.seed)
-    
+    np.random.seed(config.seed)
+    device = config.device
+
     print("="*70)
-    print("STAGE 2: FUSION TRAINING (WITH BALANCED SAMPLING)")
+    print("STAGE 2: FUSION + CLASSIFIER TRAINING (fixed)")
     print("="*70)
-    
-    # Load data
-    print("\nLoading data...")
+
     data_dict = load_data(config)
-    
-    # Load trained encoders from Stage 1
-    print("\nLoading trained encoders...")
-    encoder1 = TransformerEncoder(config)
-    encoder2 = TransformerEncoder(config)
-    
-    checkpoint1 = torch.load(f"{config.checkpoint_dir}/stage1_encoders/encoder1_frequent.pt")
-    checkpoint2 = torch.load(f"{config.checkpoint_dir}/stage1_encoders/encoder2_rare.pt")
-    
-    encoder1.load_state_dict(checkpoint1['encoder'])
-    encoder2.load_state_dict(checkpoint2['encoder'])
-    print("✓ Encoders loaded")
-    
-    # Initialize fusion and classifier
-    fusion = ChannelAttentionFusion(config)
-    classifier = IntentClassifier(config)
-    
-    print(f"\nFusion module parameters: {sum(p.numel() for p in fusion.parameters()):,}")
-    print(f"Classifier parameters: {sum(p.numel() for p in classifier.parameters()):,}")
-    
-    # Train fusion with DATAFRAMES (not dataloaders)
-    fusion, classifier = train_fusion(
-        encoder1, encoder2, fusion, classifier,
-        data_dict['train_full'],  # Pass DataFrame
-        data_dict['val_full'],    # Pass DataFrame
-        data_dict['tokenizer'],
-        data_dict['class_to_idx'],
-        config
+    tokenizer = data_dict["tokenizer"]
+    class_to_idx = data_dict["class_to_idx"]
+    train_df = data_dict["train_full"]
+    val_df = data_dict["val_full"]
+
+    train_ds = ChatbotDataset(train_df, tokenizer, config.max_seq_length, class_to_idx)
+    val_ds = ChatbotDataset(val_df, tokenizer, config.max_seq_length, class_to_idx)
+
+    train_labels = np.array([class_to_idx[i] for i in train_df["intent"]])
+    class_weights = compute_class_weights(train_labels, config.num_classes).to(device)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=config.stage2_batch_size,
+        sampler=make_balanced_sampler(train_labels, config.num_classes),
+        num_workers=config.num_workers, pin_memory=True,
     )
-    
+    val_loader = DataLoader(
+        val_ds, batch_size=config.stage2_batch_size,
+        shuffle=False, num_workers=config.num_workers, pin_memory=True,
+    )
+
+    # Load encoders from Stage 1
+    enc1_path = f"{config.checkpoint_dir}/stage1_encoders/encoder1_frequent.pt"
+    enc2_path = f"{config.checkpoint_dir}/stage1_encoders/encoder2_rare.pt"
+    if not (os.path.exists(enc1_path) and os.path.exists(enc2_path)):
+        raise FileNotFoundError(
+            "Stage 1 checkpoints missing. Run train_stage1.py first."
+        )
+    encoder1 = load_encoder(config, enc1_path).to(device)
+    encoder2 = load_encoder(config, enc2_path).to(device)
+
+    fusion = ChannelAttentionFusion(config).to(device)
+    classifier = IntentClassifier(config).to(device)
+
+    if FREEZE_ENCODERS:
+        for p in encoder1.parameters():
+            p.requires_grad = False
+        for p in encoder2.parameters():
+            p.requires_grad = False
+        encoder1.eval(); encoder2.eval()
+        trainable_params = list(fusion.parameters()) + list(classifier.parameters())
+    else:
+        trainable_params = (
+            list(encoder1.parameters()) + list(encoder2.parameters())
+            + list(fusion.parameters()) + list(classifier.parameters())
+        )
+
+    optimizer = AdamW(
+        trainable_params,
+        lr=config.stage2_lr,
+        weight_decay=config.weight_decay,
+        eps=config.adam_epsilon,
+    )
+
+    total_steps = max(1, len(train_loader) * config.stage2_epochs)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=config.stage2_lr,
+        total_steps=total_steps, pct_start=0.1, anneal_strategy="cos",
+    )
+
+    criterion = FocalLoss(gamma=2.0, weight=class_weights, label_smoothing=0.05)
+
+    best_f1, patience, bad = -1.0, 4, 0
+    os.makedirs(f"{config.checkpoint_dir}/stage2_fusion", exist_ok=True)
+
+    for epoch in range(config.stage2_epochs):
+        if not FREEZE_ENCODERS:
+            encoder1.train(); encoder2.train()
+        fusion.train(); classifier.train()
+
+        running, n = 0.0, 0
+        pbar = tqdm(train_loader, desc=f"stage2 epoch {epoch+1}/{config.stage2_epochs}")
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(device)
+            attn = batch["attention_mask"].to(device)
+            labels = batch["intent"].to(device)
+
+            if FREEZE_ENCODERS:
+                with torch.no_grad():
+                    h1 = encoder1(input_ids, attn)
+                    h2 = encoder2(input_ids, attn)
+            else:
+                h1 = encoder1(input_ids, attn)
+                h2 = encoder2(input_ids, attn)
+
+            h_fused, _ = fusion(h1, h2)
+            logits = classifier(h_fused)
+            loss = criterion(logits, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+
+            running += loss.item()
+            n += 1
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        train_loss = running / max(n, 1)
+        acc, macro_f1, preds, gts = evaluate(
+            encoder1, encoder2, fusion, classifier,
+            val_loader, device, config.num_classes,
+        )
+        print(f"  epoch {epoch+1}: train_loss={train_loss:.4f} | "
+              f"val acc={acc:.4f} macroF1={macro_f1:.4f}")
+
+        if macro_f1 > best_f1:
+            best_f1 = macro_f1
+            bad = 0
+            torch.save(
+                {
+                    "fusion": fusion.state_dict(),
+                    "classifier": classifier.state_dict(),
+                    "epoch": epoch,
+                    "val_macro_f1": macro_f1,
+                    "val_acc": acc,
+                    # Persist these too so eval can re-build the exact label order
+                    "class_to_idx": class_to_idx,
+                },
+                f"{config.checkpoint_dir}/stage2_fusion/fusion_classifier.pt",
+            )
+            # Snapshot a readable per-class report
+            report = classification_report(
+                gts, preds,
+                labels=list(range(config.num_classes)),
+                target_names=[k for k, _ in sorted(class_to_idx.items(),
+                                                   key=lambda x: x[1])],
+                zero_division=0,
+                output_dict=True,
+            )
+            os.makedirs(config.results_dir, exist_ok=True)
+            with open(f"{config.results_dir}/stage2_val_report.json", "w") as f:
+                json.dump(report, f, indent=2)
+            print(f"  saved (macroF1={macro_f1:.4f})")
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"  early stop at epoch {epoch+1}")
+                break
+
     print("\n" + "="*70)
-    print("STAGE 2 COMPLETE!")
-    print(f"Checkpoints saved to: {config.checkpoint_dir}/stage2_fusion/")
+    print(f"STAGE 2 COMPLETE | best val macroF1: {best_f1:.4f}")
     print("="*70)
+
 
 if __name__ == "__main__":
     main()
